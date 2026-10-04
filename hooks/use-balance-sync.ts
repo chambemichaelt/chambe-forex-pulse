@@ -45,47 +45,87 @@ export function useBalanceSync(
   activeAccountId: string | null,
   onBalanceUpdate: (accountId: string, balance: string, currency?: string) => void
 ): void {
-  // Keep the callback in a ref so an inline (unmemoized) callback at the call
-  // site does not tear down and recreate the subscription on every render.
   const onBalanceUpdateRef = useRef(onBalanceUpdate);
   useEffect(() => {
     onBalanceUpdateRef.current = onBalanceUpdate;
   }, [onBalanceUpdate]);
 
+  // Sync balance via raw Direct WebSocket if workspace hook passes standard socket or active token
   useEffect(() => {
-    if (!ws || !isConnected || !activeAccountId) return;
+    const token = typeof window !== 'undefined' ? localStorage.getItem('deriv_token') : null;
+    if (!token && (!ws || !isConnected || !activeAccountId)) return;
 
-    let disposed = false;
-    let unsubscribe = () => {};
+    let socket: WebSocket | null = null;
+    let isDisposed = false;
 
-    // The OTP-authorized socket is scoped to a single account — the options
-    // gateway balance schema has no `account: 'all'` parameter, so the stream
-    // covers the active account only and resubscribes on account switch.
-    ws.subscribe({ balance: 1 }, message => {
-      const update = parseBalanceUpdate(message);
-      if (!update) return;
+    // Use direct Deriv WebSocket fallback to ensure balance updates without requiring server OTP proxies
+    const connectDirectWs = () => {
+      const appId = process.env.NEXT_PUBLIC_DERIV_APP_ID ?? '34yYmvMto9OabbxhKj2Rz';
+      socket = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${appId}`);
 
-      onBalanceUpdateRef.current(
-        update.accountId ?? activeAccountId,
-        update.balance,
-        update.currency
-      );
-    })
-      .then(subscription => {
-        if (disposed) {
-          subscription.unsubscribe();
-          return;
+      socket.onopen = () => {
+        if (token && socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ authorize: token }));
         }
-        unsubscribe = subscription.unsubscribe;
-      })
-      .catch(() => {
-        // The account snapshot fetched during authentication remains available
-        // if balance streaming is temporarily unavailable.
-      });
+      };
 
-    return () => {
-      disposed = true;
-      unsubscribe();
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.msg_type === 'authorize') {
+            socket?.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+          }
+          if (data.msg_type === 'balance') {
+            const update = parseBalanceUpdate(data);
+            if (update) {
+              onBalanceUpdateRef.current(
+                update.accountId ?? activeAccountId ?? '',
+                update.balance,
+                update.currency
+              );
+            }
+          }
+        } catch {
+          // Parse protection
+        }
+      };
     };
+
+    if (ws && isConnected && activeAccountId) {
+      let unsubscribe = () => {};
+      ws.subscribe({ balance: 1 }, message => {
+        const update = parseBalanceUpdate(message);
+        if (!update) return;
+
+        onBalanceUpdateRef.current(
+          update.accountId ?? activeAccountId,
+          update.balance,
+          update.currency
+        );
+      })
+        .then(subscription => {
+          if (isDisposed) {
+            subscription.unsubscribe();
+            return;
+          }
+          unsubscribe = subscription.unsubscribe;
+        })
+        .catch(() => {
+          connectDirectWs();
+        });
+
+      return () => {
+        isDisposed = true;
+        unsubscribe();
+      };
+    } else if (token) {
+      connectDirectWs();
+      return () => {
+        isDisposed = true;
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.close();
+        }
+      };
+    }
   }, [ws, isConnected, activeAccountId]);
 }
